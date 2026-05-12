@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""bwprocs — per-process bandwidth attribution daemon.
+
+Wraps `nethogs -t -d <delay> <iface>`, parses 'Refreshing:'-delimited blocks,
+computes per-process bps deltas across refreshes, and:
+
+  1) atomically writes a top-N live snapshot JSON to
+     /var/lib/bwmon/procs_<iface>.json   (consumed by bwmon's live panel)
+
+  2) detects iface-total spikes by reading /proc/net/dev each refresh and
+     comparing to a rolling 2-min average. On a qualifying spike, appends a
+     JSONL line to /var/lib/bwmon/spikes_<iface>.jsonl with the top processes
+     captured at that moment.
+
+  3) hourly trims the spikes JSONL to the last 180 days (matches bwcollect's
+     6-month retention). SIGUSR1 forces an immediate trim.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+IFACE = sys.argv[1] if len(sys.argv) > 1 else 'enp3s0'
+DELAY = 2
+DATA_DIR = Path('/var/lib/bwmon')
+OUT = DATA_DIR / f'procs_{IFACE}.json'
+SPIKES = DATA_DIR / f'spikes_{IFACE}.jsonl'
+ALERTS = DATA_DIR / f'alerts_{IFACE}.jsonl'
+CONNTRACK = '/proc/net/nf_conntrack'
+TOP_N = 10
+TOP_SPIKE_N = 5
+TOP_FLOW_N = 5
+MIN_BPS = 64
+# Ifaces to snapshot at spike/alert time so we can show cross-iface
+# correlation (e.g. enp3s0 RX matching virbr0 TX = VM-forwarded traffic).
+MONITORED_IFACES = ['enp3s0', 'virbr0', 'vnet0', 'wg0']
+
+# ── Spike detection knobs ──
+WINDOW_SAMPLES = 60          # ~2 min of nethogs refreshes at DELAY=2
+WINDOW_MIN_FOR_AVG = 30      # need this many before classifying spikes
+SPIKE_RATIO = 5.0            # current > 5× rolling avg
+SPIKE_FLOOR_BPS = 1_000_000  # 1 Mbps floor (don't fire on idle noise)
+SPIKE_COOLDOWN_S = 30
+
+# ── Sustained-rate alert knobs (5 MB/s for 5 min) ──
+ALERT_WINDOW_SAMPLES = 150          # 5 min at DELAY=2
+ALERT_THRESHOLD_HIGH = 40_000_000   # 5 MB/s = 40 Mbps
+ALERT_THRESHOLD_LOW  = 32_000_000   # 80 % of HIGH (clear band, hysteresis)
+ALERT_CLEAR_HOLD     = 15           # ~30 s of avg < LOW before clearing
+
+# ── Retention / trim knobs ──
+RETENTION_S = 180 * 86400
+TRIM_INTERVAL_S = 3600
+EMERGENCY_TRIM_BYTES = 100 * 1024 * 1024
+
+
+_CONN_RE = __import__('re').compile(
+    r'^([0-9a-fA-F:.]+):(\d+)-([0-9a-fA-F:.]+):(\d+)$'
+)
+
+
+def _classify_unattributed(name):
+    """Turn nethogs PID=0 names into useful display labels."""
+    if name == 'unknown TCP':
+        return '(unknown TCP)'
+    m = _CONN_RE.match(name)
+    if m:
+        local_ip, local_port, peer_ip, peer_port = m.groups()
+        # Truncate IPv6 to last 2 colon-segments for readability
+        if ':' in peer_ip and peer_ip.count(':') > 1:
+            peer_ip = '…' + ':'.join(peer_ip.split(':')[-2:])
+        return f'(conn) :{local_port}→{peer_ip}:{peer_port}'
+    return f'(unmapped) {name[:40]}'
+
+
+def parse_block(lines):
+    procs = {}
+    unattr_idx = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split('\t')
+        if len(parts) != 3:
+            continue
+        try:
+            sent_kb = float(parts[1])
+            recv_kb = float(parts[2])
+        except ValueError:
+            continue
+        chunks = parts[0].rsplit('/', 2)
+        if len(chunks) != 3:
+            continue
+        name, pid_s, uid_s = chunks
+        try:
+            pid = int(pid_s)
+            uid = int(uid_s)
+        except ValueError:
+            continue
+        if pid == 0:
+            # Unattributed: keep with a synthetic label so spike records show
+            # something meaningful (esp. for forwarded VM / wg0 / kernel traffic
+            # that has no owning userspace process).
+            label = _classify_unattributed(name)
+            # Use the raw name as key so cumulative counters delta correctly.
+            key = f'__unattr__|{name}'
+            procs[key] = (label, 0, 0, sent_kb, recv_kb)
+            unattr_idx += 1
+            continue
+        key = f'{name}|{pid}'
+        procs[key] = (name, pid, uid, sent_kb, recv_kb)
+    return procs
+
+
+def write_atomic(path, data):
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, path)
+
+
+def read_iface_counters(iface):
+    try:
+        with open('/proc/net/dev') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                name, rest = line.split(':', 1)
+                if name.strip() != iface:
+                    continue
+                fields = rest.split()
+                return int(fields[0]), int(fields[8])  # rx_bytes, tx_bytes
+    except Exception:
+        return None
+    return None
+
+
+def read_all_iface_counters():
+    """Single pass over /proc/net/dev returning {iface: (rx_bytes, tx_bytes)}
+    for all entries in MONITORED_IFACES. Cheaper than calling read_iface_counters
+    once per iface."""
+    out = {}
+    try:
+        with open('/proc/net/dev') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                name, rest = line.split(':', 1)
+                name = name.strip()
+                if name not in MONITORED_IFACES:
+                    continue
+                fields = rest.split()
+                out[name] = (int(fields[0]), int(fields[8]))
+    except Exception:
+        pass
+    return out
+
+
+def snapshot_iface_rates(prev_state, now):
+    """Given prev_state {iface: (rx, tx, ts)} return {iface: {rx_bps, tx_bps}}
+    for the latest /proc/net/dev reading, compared against prev_state. Also
+    returns the new state for the next call."""
+    curr = read_all_iface_counters()
+    rates = {}
+    new_state = {}
+    for iface, (rx_b, tx_b) in curr.items():
+        new_state[iface] = (rx_b, tx_b, now)
+        if iface not in prev_state:
+            continue
+        p_rx, p_tx, p_ts = prev_state[iface]
+        dt = now - p_ts
+        if dt <= 0.1 or dt > 600:
+            continue
+        d_rx = rx_b - p_rx
+        d_tx = tx_b - p_tx
+        # 100 Gbps sanity guard against counter wrap
+        cap = 100e9 * dt / 8
+        if 0 <= d_rx <= cap and 0 <= d_tx <= cap:
+            rates[iface] = {
+                'rx_bps': round(d_rx * 8 / dt, 1),
+                'tx_bps': round(d_tx * 8 / dt, 1),
+            }
+    return rates, new_state
+
+
+def snapshot_top_flows(top_n=TOP_FLOW_N):
+    """Parse /proc/net/nf_conntrack, sum bytes both directions per flow,
+    return top-N by total bytes. Returns [] if conntrack unavailable
+    or accounting disabled (all bytes=0).
+
+    Each conntrack line has TWO bytes= fields (one per direction); we sum.
+    """
+    flows = []
+    try:
+        with open(CONNTRACK) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                family = parts[0]            # ipv4 or ipv6
+                proto = parts[2]             # tcp/udp/icmp
+                state = ''
+                src = dst = ''
+                sport = dport = 0
+                bytes_total = 0
+                packets_total = 0
+                # State lives at fixed position 5 for tcp; otherwise blank
+                if proto == 'tcp' and len(parts) > 5:
+                    state = parts[5]
+                # walk attribute key=val tokens, take FIRST src/dst/sport/dport
+                # (origin direction) and accumulate ALL bytes= and packets=
+                for tok in parts:
+                    if '=' not in tok:
+                        continue
+                    k, _, v = tok.partition('=')
+                    if k == 'src' and not src:
+                        src = v
+                    elif k == 'dst' and not dst:
+                        dst = v
+                    elif k == 'sport' and not sport:
+                        try: sport = int(v)
+                        except ValueError: pass
+                    elif k == 'dport' and not dport:
+                        try: dport = int(v)
+                        except ValueError: pass
+                    elif k == 'bytes':
+                        try: bytes_total += int(v)
+                        except ValueError: pass
+                    elif k == 'packets':
+                        try: packets_total += int(v)
+                        except ValueError: pass
+                if not src or not dst or bytes_total <= 0:
+                    continue
+                flows.append({
+                    'family': family, 'proto': proto, 'state': state,
+                    'src': src, 'sport': sport, 'dst': dst, 'dport': dport,
+                    'bytes': bytes_total, 'packets': packets_total,
+                })
+    except Exception:
+        return []
+    flows.sort(key=lambda f: -f['bytes'])
+    return flows[:top_n]
+
+
+def append_jsonl(path, record):
+    try:
+        line = json.dumps(record, separators=(',', ':')) + '\n'
+        with open(path, 'a') as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def append_spike(record):
+    append_jsonl(SPIKES, record)
+
+
+def append_alert(record):
+    append_jsonl(ALERTS, record)
+
+
+def trim_jsonl_file(path):
+    """Drop entries older than RETENTION_S. Atomic tmp+rename."""
+    if not path.exists():
+        return
+    cutoff = time.time() - RETENTION_S
+    tmp = f'{path}.tmp'
+    try:
+        with open(path) as src, open(tmp, 'w') as dst:
+            for line in src:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = float(line.split(',', 1)[0].split(':', 1)[1])
+                except (ValueError, IndexError):
+                    try:
+                        ts = float(json.loads(line).get('ts', 0))
+                    except Exception:
+                        continue
+                if ts >= cutoff:
+                    dst.write(line + '\n')
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def trim_spikes_file():
+    trim_jsonl_file(SPIKES)
+
+
+def trim_alerts_file():
+    trim_jsonl_file(ALERTS)
+
+
+def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    write_atomic(OUT, {
+        'iface': IFACE, 'ts': time.time(), 'interval_seconds': DELAY,
+        'processes': [], 'note': 'starting',
+    })
+
+    # Spike detection state
+    totals_window = deque(maxlen=WINDOW_SAMPLES)
+    last_spike_ts = 0.0
+    last_trim_ts = time.time()
+    iface_prev_rx = None
+    iface_prev_tx = None
+    iface_prev_ts = None
+    force_trim = [False]
+
+    # Per-iface rate state for the cross-iface snapshot at spike/alert time.
+    # Updated every refresh; sampled (read-only) when emitting a record.
+    all_iface_state = {}  # {iface: (rx_bytes, tx_bytes, ts)}
+    last_iface_rates = {}  # {iface: {rx_bps, tx_bps}}
+
+    # Sustained-rate alert state (longer window for "5 min sustained")
+    alert_window = deque(maxlen=ALERT_WINDOW_SAMPLES)
+    alert_state = 'NORMAL'      # NORMAL | ALERTING | CLEARING
+    alert_clear_hold = 0
+    alert_fired_at = None
+    alert_peak_bps = 0.0
+
+    proc = subprocess.Popen(
+        ['/usr/sbin/nethogs', '-t', '-d', str(DELAY), IFACE],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        bufsize=1, universal_newlines=True,
+    )
+
+    def cleanup(*_):
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        sys.exit(0)
+
+    def on_usr1(*_):
+        force_trim[0] = True
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGUSR1, on_usr1)
+
+    block = []
+    prev_procs = {}
+    prev_ts = None
+
+    for line in proc.stdout:
+        line = line.rstrip('\n')
+        if line.startswith('Refreshing:'):
+            if block:
+                curr = parse_block(block)
+                now = time.time()
+
+                # Build the live rows
+                rows = []
+                if prev_ts is not None:
+                    dt = max(now - prev_ts, 0.5)
+                    for key, (name, pid, uid, sent, recv) in curr.items():
+                        if key in prev_procs:
+                            p_sent, p_recv = prev_procs[key][3], prev_procs[key][4]
+                        else:
+                            p_sent, p_recv = sent, recv
+                        delta_sent_kb = max(0.0, sent - p_sent)
+                        delta_recv_kb = max(0.0, recv - p_recv)
+                        tx_bps = delta_sent_kb * 1024 * 8 / dt
+                        rx_bps = delta_recv_kb * 1024 * 8 / dt
+                        if tx_bps + rx_bps < MIN_BPS:
+                            continue
+                        rows.append({
+                            'name': name, 'pid': pid, 'uid': uid,
+                            'tx_bps': tx_bps, 'rx_bps': rx_bps,
+                        })
+                    rows.sort(key=lambda r: -(r['tx_bps'] + r['rx_bps']))
+                    write_atomic(OUT, {
+                        'iface': IFACE, 'ts': now,
+                        'interval_seconds': round(dt, 3),
+                        'processes': rows[:TOP_N],
+                    })
+                else:
+                    write_atomic(OUT, {
+                        'iface': IFACE, 'ts': now,
+                        'interval_seconds': DELAY,
+                        'processes': [], 'note': 'priming',
+                    })
+
+                # ── per-iface rate snapshot for cross-iface attribution ──
+                rates_now, all_iface_state = snapshot_iface_rates(all_iface_state, now)
+                if rates_now:
+                    last_iface_rates = rates_now
+
+                # ── iface-total bandwidth via /proc/net/dev ──
+                counters = read_iface_counters(IFACE)
+                if counters is not None:
+                    rx_b, tx_b = counters
+                    total_bps_iface = None
+                    rx_bps_iface = 0.0
+                    tx_bps_iface = 0.0
+                    if iface_prev_ts is not None:
+                        dt2 = max(now - iface_prev_ts, 0.5)
+                        d_rx = rx_b - iface_prev_rx
+                        d_tx = tx_b - iface_prev_tx
+                        # Counter-wrap / sanity guard (≤100 Gbps per direction)
+                        if 0 <= d_rx <= 100e9 * dt2 / 8 and 0 <= d_tx <= 100e9 * dt2 / 8:
+                            rx_bps_iface = d_rx * 8 / dt2
+                            tx_bps_iface = d_tx * 8 / dt2
+                            total_bps_iface = rx_bps_iface + tx_bps_iface
+                            totals_window.append(total_bps_iface)
+
+                    iface_prev_rx, iface_prev_tx, iface_prev_ts = rx_b, tx_b, now
+
+                    # ── Spike check ──
+                    if (total_bps_iface is not None
+                            and len(totals_window) >= WINDOW_MIN_FOR_AVG
+                            and now - last_spike_ts >= SPIKE_COOLDOWN_S):
+                        avg = sum(totals_window) / len(totals_window)
+                        if (total_bps_iface > SPIKE_FLOOR_BPS
+                                and avg > 0
+                                and total_bps_iface > SPIKE_RATIO * avg):
+                            top_for_spike = rows[:TOP_SPIKE_N]
+                            append_spike({
+                                'ts': round(now, 3),
+                                'iface': IFACE,
+                                'total_bps': round(total_bps_iface, 1),
+                                'rx_bps': round(rx_bps_iface, 1),
+                                'tx_bps': round(tx_bps_iface, 1),
+                                'avg_bps': round(avg, 1),
+                                'trigger': f'{SPIKE_RATIO:g}x_rolling',
+                                'top': [
+                                    {'name': r['name'], 'pid': r['pid'], 'uid': r['uid'],
+                                     'tx_bps': round(r['tx_bps'], 1),
+                                     'rx_bps': round(r['rx_bps'], 1)}
+                                    for r in top_for_spike
+                                ],
+                                'iface_rates': last_iface_rates,
+                                'top_flows': snapshot_top_flows(),
+                            })
+                            last_spike_ts = now
+
+                    # ── Sustained-rate alert check (5 min ≥ 40 Mbps) ──
+                    if total_bps_iface is not None:
+                        alert_window.append(total_bps_iface)
+                        if len(alert_window) >= ALERT_WINDOW_SAMPLES:
+                            a_avg = sum(alert_window) / len(alert_window)
+                            a_peak_window = max(alert_window)
+
+                            if alert_state == 'NORMAL' and a_avg > ALERT_THRESHOLD_HIGH:
+                                alert_state = 'ALERTING'
+                                alert_fired_at = now
+                                alert_peak_bps = a_peak_window
+                                top_for_alert = rows[:TOP_SPIKE_N]
+                                # average rx/tx during the breach window
+                                rx_avg_window = a_avg * (rx_bps_iface / total_bps_iface) if total_bps_iface > 0 else 0
+                                tx_avg_window = a_avg - rx_avg_window
+                                append_alert({
+                                    'ts': round(now, 3),
+                                    'event': 'FIRED',
+                                    'iface': IFACE,
+                                    'threshold_bps': ALERT_THRESHOLD_HIGH,
+                                    'rolling_avg_bps': round(a_avg, 1),
+                                    'peak_bps_in_window': round(a_peak_window, 1),
+                                    'rx_avg_bps': round(rx_avg_window, 1),
+                                    'tx_avg_bps': round(tx_avg_window, 1),
+                                    'top': [
+                                        {'name': r['name'], 'pid': r['pid'], 'uid': r['uid'],
+                                         'tx_bps': round(r['tx_bps'], 1),
+                                         'rx_bps': round(r['rx_bps'], 1)}
+                                        for r in top_for_alert
+                                    ],
+                                    'iface_rates': last_iface_rates,
+                                    'top_flows': snapshot_top_flows(),
+                                })
+                            elif alert_state == 'ALERTING':
+                                if a_peak_window > alert_peak_bps:
+                                    alert_peak_bps = a_peak_window
+                                if a_avg < ALERT_THRESHOLD_LOW:
+                                    alert_state = 'CLEARING'
+                                    alert_clear_hold = 0
+                            elif alert_state == 'CLEARING':
+                                if a_peak_window > alert_peak_bps:
+                                    alert_peak_bps = a_peak_window
+                                if a_avg > ALERT_THRESHOLD_HIGH:
+                                    alert_state = 'ALERTING'  # bounced back, no new FIRED
+                                    alert_clear_hold = 0
+                                elif a_avg < ALERT_THRESHOLD_LOW:
+                                    alert_clear_hold += 1
+                                    if alert_clear_hold >= ALERT_CLEAR_HOLD:
+                                        append_alert({
+                                            'ts': round(now, 3),
+                                            'event': 'CLEARED',
+                                            'iface': IFACE,
+                                            'fired_at': round(alert_fired_at or now, 3),
+                                            'duration_s': round(now - (alert_fired_at or now), 1),
+                                            'peak_during_event_bps': round(alert_peak_bps, 1),
+                                        })
+                                        alert_state = 'NORMAL'
+                                        alert_fired_at = None
+                                        alert_peak_bps = 0.0
+                                else:
+                                    # in the clear band but not yet held long enough — reset hold
+                                    alert_clear_hold = 0
+
+                # ── Retention trim (hourly OR on SIGUSR1 OR if file too big) ──
+                do_trim = False
+                if force_trim[0]:
+                    do_trim = True
+                    force_trim[0] = False
+                elif now - last_trim_ts >= TRIM_INTERVAL_S:
+                    do_trim = True
+                else:
+                    try:
+                        if SPIKES.exists() and SPIKES.stat().st_size > EMERGENCY_TRIM_BYTES:
+                            do_trim = True
+                    except OSError:
+                        pass
+                if do_trim:
+                    trim_spikes_file()
+                    trim_alerts_file()
+                    last_trim_ts = now
+
+                prev_procs = curr
+                prev_ts = now
+                block = []
+            continue
+        if line.strip():
+            block.append(line)
+
+    proc.wait()
+    cleanup()
+
+
+if __name__ == '__main__':
+    main()

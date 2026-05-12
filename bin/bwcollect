@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""bwcollect — record a 5-minute bandwidth sample to /var/lib/bwmon/bw_<iface>.csv"""
+import json, os, sys, time
+
+IFACE  = sys.argv[1] if len(sys.argv) > 1 else 'enp3s0'
+DIR    = '/var/lib/bwmon'
+STATE  = f'{DIR}/state_{IFACE}.json'
+DATA   = f'{DIR}/bw_{IFACE}.csv'
+KEEP   = 180 * 86400        # 6 months of history
+MAX_BPS = 100 * 1e9         # sanity cap: 100 Gbps (counter wrap guard)
+
+os.makedirs(DIR, exist_ok=True)
+
+def read_counters(iface):
+    with open('/proc/net/dev') as f:
+        for line in f:
+            if ':' not in line:
+                continue
+            name, data = line.split(':', 1)
+            if name.strip() == iface:
+                fields = data.split()
+                return int(fields[0]), int(fields[8])  # rx_bytes, tx_bytes
+    raise SystemExit(f"bwcollect: interface '{iface}' not found")
+
+now = time.time()
+cur_rx, cur_tx = read_counters(IFACE)
+
+if os.path.exists(STATE):
+    with open(STATE) as f:
+        s = json.load(f)
+    dt = now - s['ts']
+    delta_rx = cur_rx - s['rx']
+    delta_tx = cur_tx - s['tx']
+    if dt > 0 and 0 <= delta_rx < MAX_BPS and 0 <= delta_tx < MAX_BPS:
+        rx_bps = delta_rx * 8 / dt
+        tx_bps = delta_tx * 8 / dt
+        with open(DATA, 'a') as f:
+            f.write(f"{int(now)},{rx_bps:.0f},{tx_bps:.0f}\n")
+
+with open(STATE, 'w') as f:
+    json.dump({'ts': now, 'rx': cur_rx, 'tx': cur_tx}, f)
+
+# Trim records older than 6 months
+cutoff = int(now - KEEP)
+try:
+    with open(DATA) as f:
+        lines = [l for l in f if l.strip() and int(l.split(',')[0]) >= cutoff]
+    with open(DATA, 'w') as f:
+        f.writelines(lines)
+except (FileNotFoundError, ValueError, IndexError):
+    pass

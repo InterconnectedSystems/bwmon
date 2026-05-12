@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Real-time server bandwidth monitor — reads /proc/net/dev, no dependencies."""
+import sys, time, os, signal
+
+SKIP   = {'lo'}
+IFACE  = 'enp3s0'          # default watch interface; override: bwmon eth0
+HIST   = 60                # seconds of bar-chart history
+COLORS = {
+    'reset':  '\033[0m',
+    'bold':   '\033[1m',
+    'dim':    '\033[2m',
+    'rx':     '\033[38;5;81m',   # cyan-blue
+    'tx':     '\033[38;5;214m',  # amber
+    'head':   '\033[38;5;153m',  # light blue
+    'muted':  '\033[38;5;240m',
+    'green':  '\033[38;5;83m',
+    'red':    '\033[38;5;203m',
+    'bar_rx': '\033[48;5;24m',
+    'bar_tx': '\033[48;5;130m',
+    'bar_bg': '\033[48;5;234m',
+}
+C = COLORS
+
+def clr(name, text):
+    return f"{C[name]}{text}{C['reset']}"
+
+def read_ifaces():
+    ifaces = {}
+    with open('/proc/net/dev') as f:
+        for line in f:
+            if ':' not in line:
+                continue
+            name, data = line.split(':', 1)
+            name = name.strip()
+            if name in SKIP:
+                continue
+            fields = data.split()
+            ifaces[name] = {
+                'rx': int(fields[0]),
+                'tx': int(fields[8]),
+                'rx_pkt': int(fields[1]),
+                'tx_pkt': int(fields[9]),
+                'rx_err': int(fields[2]),
+                'tx_err': int(fields[10]),
+                'rx_drop': int(fields[3]),
+                'tx_drop': int(fields[11]),
+            }
+    return ifaces
+
+def fmt_rate(bps):
+    if bps >= 1e9:
+        return f"{bps/1e9:7.2f} Gbps"
+    if bps >= 1e6:
+        return f"{bps/1e6:7.2f} Mbps"
+    if bps >= 1e3:
+        return f"{bps/1e3:7.2f} Kbps"
+    return f"{bps:7.0f}  bps"
+
+def fmt_bytes(b):
+    for unit in ('B','KB','MB','GB','TB'):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+def fmt_pkt(n):
+    if n >= 1e6: return f"{n/1e6:.1f}M"
+    if n >= 1e3: return f"{n/1e3:.1f}K"
+    return str(n)
+
+def draw_bar(rate, peak, width, color_key):
+    filled = int((rate / peak) * width) if peak > 0 else 0
+    filled = min(filled, width)
+    bar = C[color_key] + '█' * filled + C['reset']
+    bar += C['muted'] + '░' * (width - filled) + C['reset']
+    return bar
+
+def draw_sparkline(history, width, color_key):
+    blocks = ' ▁▂▃▄▅▆▇█'
+    if not history:
+        return C['muted'] + '─' * width + C['reset']
+    window = history[-width:]
+    peak = max(window) if max(window) > 0 else 1
+    line = ''
+    for v in window:
+        idx = int((v / peak) * (len(blocks) - 1))
+        line += C[color_key] + blocks[idx] + C['reset']
+    return ' ' * (width - len(window)) + line
+
+def clear_screen():
+    sys.stdout.write('\033[2J\033[H')
+
+def hide_cursor():
+    sys.stdout.write('\033[?25l')
+
+def show_cursor():
+    sys.stdout.write('\033[?25h')
+
+def get_term_width():
+    try:
+        return os.get_terminal_size().columns
+    except:
+        return 80
+
+def run(iface):
+    signal.signal(signal.SIGINT,  lambda *_: (show_cursor(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *_: (show_cursor(), sys.exit(0)))
+    hide_cursor()
+
+    prev = None
+    prev_ts = None
+    peak_rx = peak_tx = 0.0
+    total_rx = total_tx = 0
+    hist_rx = []
+    hist_tx = []
+    session_start = time.time()
+    errors_shown = False
+
+    while True:
+        now = read_ifaces()
+        ts  = time.monotonic()
+        wall = time.time()
+
+        if iface not in now:
+            clear_screen()
+            print(clr('red', f"Interface '{iface}' not found."))
+            print("Available:", ', '.join(now.keys()))
+            time.sleep(2)
+            continue
+
+        cur = now[iface]
+
+        if prev is not None and iface in prev:
+            dt = ts - prev_ts
+            if dt > 0:
+                rx_bps = (cur['rx'] - prev[iface]['rx']) * 8 / dt
+                tx_bps = (cur['tx'] - prev[iface]['tx']) * 8 / dt
+                rx_bps = max(rx_bps, 0)
+                tx_bps = max(tx_bps, 0)
+                total_rx += cur['rx'] - prev[iface]['rx']
+                total_tx += cur['tx'] - prev[iface]['tx']
+                peak_rx = max(peak_rx, rx_bps)
+                peak_tx = max(peak_tx, tx_bps)
+                hist_rx.append(rx_bps)
+                hist_tx.append(tx_bps)
+                if len(hist_rx) > HIST * 4:
+                    hist_rx = hist_rx[-HIST * 4:]
+                    hist_tx = hist_tx[-HIST * 4:]
+
+                w = get_term_width()
+                bar_w = max(w - 22, 20)
+                spark_w = min(bar_w, 60)
+                uptime = int(wall - session_start)
+                h, m, s = uptime//3600, (uptime%3600)//60, uptime%60
+
+                lines = []
+                sep = clr('muted', '─' * w)
+
+                lines.append('')
+                lines.append(f"  {C['bold']}{C['head']}ISI Bandwidth Monitor{C['reset']}  "
+                             f"{C['muted']}interface:{C['reset']} {C['bold']}{iface}{C['reset']}  "
+                             f"{C['muted']}uptime:{C['reset']} {h:02d}:{m:02d}:{s:02d}  "
+                             f"{C['muted']}press Ctrl+C to exit{C['reset']}")
+                lines.append(sep)
+
+                # RX
+                rx_pct = int(rx_bps / peak_rx * 100) if peak_rx > 0 else 0
+                lines.append(f"  {clr('rx','▼ RX')}  {clr('rx', fmt_rate(rx_bps))}  "
+                             f"{C['muted']}peak {fmt_rate(peak_rx)}  {rx_pct:3d}%{C['reset']}")
+                lines.append(f"  {draw_bar(rx_bps, peak_rx, bar_w, 'rx')} ")
+                lines.append(f"  {C['muted']}sparkline (60s):{C['reset']}  "
+                             f"{draw_sparkline(hist_rx, spark_w, 'rx')}")
+
+                lines.append(sep)
+
+                # TX
+                tx_pct = int(tx_bps / peak_tx * 100) if peak_tx > 0 else 0
+                lines.append(f"  {clr('tx','▲ TX')}  {clr('tx', fmt_rate(tx_bps))}  "
+                             f"{C['muted']}peak {fmt_rate(peak_tx)}  {tx_pct:3d}%{C['reset']}")
+                lines.append(f"  {draw_bar(tx_bps, peak_tx, bar_w, 'tx')} ")
+                lines.append(f"  {C['muted']}sparkline (60s):{C['reset']}  "
+                             f"{draw_sparkline(hist_tx, spark_w, 'tx')}")
+
+                lines.append(sep)
+
+                # Totals / packets / errors row
+                rx_err  = cur['rx_err']  + cur['rx_drop']
+                tx_err  = cur['tx_err']  + cur['tx_drop']
+                err_col = 'red' if (rx_err or tx_err) else 'muted'
+                lines.append(
+                    f"  {C['muted']}Session RX:{C['reset']} {clr('rx', fmt_bytes(total_rx))}  "
+                    f"{C['muted']}TX:{C['reset']} {clr('tx', fmt_bytes(total_tx))}    "
+                    f"{C['muted']}pkts RX:{C['reset']} {fmt_pkt(cur['rx_pkt'])}  "
+                    f"{C['muted']}TX:{C['reset']} {fmt_pkt(cur['tx_pkt'])}    "
+                    f"{C[err_col]}err+drop RX:{rx_err} TX:{tx_err}{C['reset']}"
+                )
+
+                # All other interfaces summary — show live rates, not totals
+                others = [(n, d) for n, d in now.items() if n != iface]
+                if others and prev:
+                    lines.append(sep)
+                    row = f"  {C['muted']}other ifaces:{C['reset']}  "
+                    for n, d in others:
+                        if n in prev and dt > 0:
+                            o_rx = max((d['rx'] - prev[n]['rx']) * 8 / dt, 0)
+                            o_tx = max((d['tx'] - prev[n]['tx']) * 8 / dt, 0)
+                        else:
+                            o_rx = o_tx = 0.0
+                        row += f"{C['dim']}{n}{C['reset']} "
+                        row += f"{C['rx']}▼{fmt_rate(o_rx).strip()}{C['reset']} "
+                        row += f"{C['tx']}▲{fmt_rate(o_tx).strip()}{C['reset']}   "
+                    lines.append(row)
+
+                lines.append('')
+
+                clear_screen()
+                print('\n'.join(lines), end='', flush=True)
+
+        prev = now
+        prev_ts = ts
+        time.sleep(0.25)
+
+if __name__ == '__main__':
+    iface = sys.argv[1] if len(sys.argv) > 1 else IFACE
+    run(iface)

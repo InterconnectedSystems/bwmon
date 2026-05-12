@@ -1,0 +1,20 @@
+[Unit]
+Description=bwprocs — per-process bandwidth attribution for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bwprocs %i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bwmon
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
