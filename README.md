@@ -13,10 +13,13 @@ alerts, and 6 months of history — installed in one command, no agents, no
 cloud, no signup.
 
 ```bash
-git clone <this-repo> bwmon && cd bwmon && sudo ./setup.sh
+git clone https://github.com/InterconnectedSystems/bwmon.git
+cd bwmon && sudo ./setup.sh
 ```
 
 That's the whole install. Open `http://<host>:8080/` when it finishes.
+
+![bwmon dashboard](docs/dashboard.png)
 
 ---
 
@@ -61,6 +64,8 @@ the heavyweight stacks are still the right answer.
 
 ## Features
 
+![Live panel](docs/live-panel.png)
+
 - **Live panel** — 1-second-poll RX/TX with a rolling chart for the active
   interface and an instant top-process list.
 - **Per-process attribution** — daemonised `nethogs` writes the top talkers
@@ -69,8 +74,13 @@ the heavyweight stacks are still the right answer.
   average, a spike record is written with: per-process attribution captured
   at the spike instant, *all*-iface RX/TX breakdown (so VM/WireGuard/NAT
   forwarding is visible), and the top conntrack flows by lifetime bytes.
+
+  ![Spike detail](docs/spike-detail.png)
 - **History** — 5-minute samples kept for 6 months with adaptive bucketing
-  for the 1h / 24h / 7d / 30d / 6m / all-time views.
+  for the 1h / 24h / 7d / 30d / 6m / all-time views. Spike markers are
+  clickable for the forensic view above.
+
+  ![History chart](docs/history.png)
 - **Heatmap & distribution** — hour-of-day × day-of-week average rates and
   a histogram of how often each rate occurs.
 - **Sustained alerts** — when the rolling 5-minute average crosses 40 Mbps a
