@@ -259,8 +259,16 @@ bwmonthly <iface>  # append a monthly total line and print it
 ### The dashboard loads but RX/TX are zero / dashes forever
 Live numbers need the *second* `live.php` poll to have a delta — wait one
 second after first paint. If they still don't move, hit `api/live.php?iface=<name>`
-directly. A `404 no data` means the interface name is wrong; pick from the
-dropdown.
+directly. Two checks:
+
+- A `404 no data` means the interface name is wrong; pick from the dropdown.
+- `rx_bps: null` / `tx_bps: null` on every poll means `/var/lib/bwmon/` isn't
+  writable by the web server, so `live.php` can't maintain its counter
+  checkpoint. Fix:
+  ```bash
+  sudo chgrp www-data /var/lib/bwmon && sudo chmod g+w /var/lib/bwmon
+  ```
+  (Or just re-run `sudo ./setup.sh` — newer builds set this automatically.)
 
 ### "no process data" in the live panel
 `bwprocs@<iface>.service` isn't running. Check:

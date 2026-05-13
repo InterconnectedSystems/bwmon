@@ -15,7 +15,7 @@ PORT="${PORT:-8080}"
 IFACE="${IFACE:-}"
 SKIP_DEPS=0
 SKIP_NGINX=0
-WEB_USER="${WEB_USER:-www-data}"
+WEB_GROUP="${WEB_GROUP:-}"
 
 usage() {
     cat <<EOF
@@ -94,8 +94,24 @@ install -m 0755 "$SRC_DIR/bin/bwmonthly" "$BIN_DIR/bwmonthly"
 ok "collector scripts installed"
 
 # ── Data directory ────────────────────────────────────────────────────────────
-install -d -m 0755 -o root -g root "$DATA_DIR"
-ok "data directory ready: $DATA_DIR"
+# /var/lib/bwmon must be writable by the web server so live.php can maintain
+# its 1-second-poll counter checkpoint. Without g+w on the dir the live graph
+# never updates (rx_bps/tx_bps come back null).
+if [ -z "$WEB_GROUP" ]; then
+    for g in www-data nginx apache http; do
+        if getent group "$g" >/dev/null; then WEB_GROUP="$g"; break; fi
+    done
+fi
+if [ -z "$WEB_GROUP" ]; then
+    warn "could not auto-detect web group — falling back to root (live graph may not update)"
+    WEB_GROUP="root"
+fi
+install -d -m 2775 -o root -g "$WEB_GROUP" "$DATA_DIR"
+# Fix up an existing dir (re-run / pre-existing data) so live.php can write
+chgrp -R "$WEB_GROUP" "$DATA_DIR"
+chmod g+w "$DATA_DIR"
+chmod g+s "$DATA_DIR"  # new files inherit the web group
+ok "data directory ready: $DATA_DIR (group: $WEB_GROUP, setgid)"
 
 # ── Web root ──────────────────────────────────────────────────────────────────
 log "copying web app to $PREFIX/web/"

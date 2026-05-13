@@ -6,6 +6,14 @@ All notable changes to bwmon are documented here. Format roughly follows
 
 ## [Unreleased]
 
+### Fixed
+- `setup.sh` now creates `/var/lib/bwmon` group-owned by the php-fpm group
+  (auto-detected: `www-data` on Debian/Ubuntu, falls back to `nginx`/`apache`/
+  `http`) with mode `2775`. Without this, `live.php` couldn't write its
+  counter checkpoint and the live graph never updated — every poll returned
+  `rx_bps: null` / `tx_bps: null`. Re-running `sudo ./setup.sh` on an
+  affected host fixes the permissions in place.
+
 ## [1.0.0] — 2026-05-13
 
 Initial public release. The codebase is the production build that has been
