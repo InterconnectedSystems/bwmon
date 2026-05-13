@@ -37,6 +37,9 @@ systemctl daemon-reload
 log "removing cron"
 rm -f /etc/cron.d/bwmon
 
+log "removing module/sysctl drop-ins"
+rm -f /etc/modules-load.d/bwmon.conf /etc/sysctl.d/99-bwmon-conntrack.conf
+
 log "removing collector scripts"
 for f in bwcollect bwprocs bwhistory bwmon bwweekly bwmonthly; do
     rm -f "$BIN_DIR/$f"

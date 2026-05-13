@@ -308,6 +308,21 @@ The spike record genuinely predates `iface_rates`/`top_flows` data — this
 happens for spikes captured by an old `bwprocs` build. New spikes after
 upgrading will have the full flow table.
 
+### Spike says "No tracked flows had byte counters at this moment"
+Conntrack byte accounting is off on this host. Every entry in
+`/proc/net/nf_conntrack` has `bytes=0`, so `bwprocs` drops them all.
+`setup.sh` enables this for you (sysctl + persistent drop-in); if you ran
+an older build, fix in place:
+```bash
+sudo modprobe nf_conntrack
+sudo sysctl -w net.netfilter.nf_conntrack_acct=1
+echo 'nf_conntrack' | sudo tee /etc/modules-load.d/bwmon.conf
+echo 'net.netfilter.nf_conntrack_acct = 1' | sudo tee /etc/sysctl.d/99-bwmon-conntrack.conf
+sudo systemctl restart bwprocs@<iface>.service
+```
+Existing spike records can't be backfilled — accounting must be on at the
+moment the spike fires.
+
 ### bwprocs crashes when conntrack table is huge (>1 M flows)
 Reduce the number of flows captured per spike. Edit `MAX_FLOWS_PER_SPIKE`
 near the top of `/usr/local/bin/bwprocs` (default 50) downward, then

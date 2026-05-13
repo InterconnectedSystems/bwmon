@@ -125,6 +125,24 @@ for f in "$SRC_DIR"/web/api/*.php; do
 done
 ok "web app deployed"
 
+# ── conntrack byte accounting ─────────────────────────────────────────────────
+# The "top connection flows" table in the spike detail panel reads
+# /proc/net/nf_conntrack. The module needs to be loaded and byte accounting
+# enabled — otherwise every flow shows bytes=0 and bwprocs drops them.
+if ! lsmod 2>/dev/null | awk '{print $1}' | grep -qx nf_conntrack; then
+    modprobe nf_conntrack 2>/dev/null && ok "loaded nf_conntrack module" \
+        || warn "could not load nf_conntrack — spike flow table will be empty"
+fi
+echo nf_conntrack > /etc/modules-load.d/bwmon.conf
+sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
+cat >/etc/sysctl.d/99-bwmon-conntrack.conf <<'SYSCTL'
+# bwmon — enable byte/packet accounting on conntrack entries so the spike
+# detail panel can show top connection flows. Without this, all flows read
+# from /proc/net/nf_conntrack have bytes=0 and bwprocs filters them out.
+net.netfilter.nf_conntrack_acct = 1
+SYSCTL
+ok "conntrack byte accounting enabled (persistent)"
+
 # ── systemd unit ──────────────────────────────────────────────────────────────
 install -m 0644 "$SRC_DIR/systemd/bwprocs@.service" "$SYSTEMD_DIR/bwprocs@.service"
 systemctl daemon-reload

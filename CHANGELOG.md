@@ -7,6 +7,13 @@ All notable changes to bwmon are documented here. Format roughly follows
 ## [Unreleased]
 
 ### Fixed
+- `setup.sh` now loads `nf_conntrack` and enables
+  `net.netfilter.nf_conntrack_acct=1` (with persistence under
+  `/etc/modules-load.d/` and `/etc/sysctl.d/`). Without conntrack byte
+  accounting, every flow read from `/proc/net/nf_conntrack` has `bytes=0`,
+  `bwprocs` drops it, and the spike-detail "Top connection flows" table
+  comes up empty. Existing spikes can't be backfilled — accounting must be
+  on *at the moment* the spike fires.
 - `setup.sh` now creates `/var/lib/bwmon` group-owned by the php-fpm group
   (auto-detected: `www-data` on Debian/Ubuntu, falls back to `nginx`/`apache`/
   `http`) with mode `2775`. Without this, `live.php` couldn't write its
